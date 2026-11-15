@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"net"
-	"os"
 	"path/filepath"
 	"slices"
 	"strconv"
@@ -78,8 +77,8 @@ func fingerprintMaterial(value string) string {
 	if value != "" && !strings.Contains(value, "-----BEGIN ") {
 		path := filepath.Clean(value)
 		// Only resolve relative certificate files that remain inside the local directory.
-		if filepath.IsLocal(path) && xray.CheckCertFile(path) == nil {
-			if file, err := os.ReadFile(path); err == nil {
+		if filepath.IsLocal(path) {
+			if file, err := xray.ReadCertificateFileFromRoot(".", path); err == nil {
 				material = file
 			}
 		}
@@ -287,3 +286,4 @@ func NormalizeCongestionControl(value string) (string, error) {
 		return "", fmt.Errorf("tuic: unsupported congestion controller %q", value)
 	}
 }
+

@@ -2,6 +2,8 @@ package xray
 
 import (
 	"encoding/json"
+	"io"
+	"net/url"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -161,34 +163,7 @@ func checkCertFileKeys(v any) error {
 const localCertPathError = "TLS certificate file must be a regular file within the local certificate directory"
 
 func checkCertFileWithinLocalDirectory(path string) error {
-	root, err := filepath.Abs(platform.GetCertLocation("."))
-	if err != nil {
-		return common.NewError(localCertPathError)
-	}
-	candidate, err := filepath.Abs(path)
-	if err != nil || !pathIsWithin(root, candidate) {
-		return common.NewError(localCertPathError)
-	}
-	relative, err := filepath.Rel(root, candidate)
-	if err != nil {
-		return common.NewError(localCertPathError)
-	}
-	if !filepath.IsLocal(relative) {
-		return common.NewError(localCertPathError)
-	}
-
-	// OpenRoot keeps the metadata check rooted even when an attacker races path
-	// replacement or supplies a symlink; the core later reads only paths accepted here.
-	certRoot, err := os.OpenRoot(root)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return nil
-		}
-		return common.NewError(localCertPathError)
-	}
-	defer certRoot.Close()
-
-	file, err := certRoot.Open(relative)
+	certRoot, file, err := openCertFileWithinRoot(platform.GetCertLocation("."), path)
 	if err != nil {
 		if os.IsNotExist(err) {
 			// Operators may provision the certificate after saving the configuration.
@@ -197,6 +172,7 @@ func checkCertFileWithinLocalDirectory(path string) error {
 		return common.NewError(localCertPathError)
 	}
 	defer file.Close()
+	defer certRoot.Close()
 	info, err := file.Stat()
 	if err != nil {
 		return common.NewError(localCertPathError)
@@ -205,6 +181,111 @@ func checkCertFileWithinLocalDirectory(path string) error {
 		return common.NewErrorf("certificate file %q must be a regular file of at most %d bytes", path, maxCertFileBytes)
 	}
 	return nil
+}
+
+// ReadLocalCertFile reads a bounded certificate file without allowing its path or
+// a symlink inside it to escape Xray's certificate directory.
+func ReadLocalCertFile(path string) ([]byte, error) {
+	return ReadCertificateFileFromRoot(platform.GetCertLocation("."), path)
+}
+
+// ReadCertificateFileFromRoot reads a bounded regular file through an os.Root.
+func ReadCertificateFileFromRoot(root, path string) ([]byte, error) {
+	certRoot, file, err := openCertFileWithinRoot(root, path)
+	if err != nil {
+		return nil, common.NewError(localCertPathError)
+	}
+	defer certRoot.Close()
+	defer file.Close()
+	return readBoundedCertFile(file, path)
+}
+
+// ReadConfiguredCertFile reads one operator-configured path beneath the supplied
+// directory. Callers must first establish that the path is an approved config value.
+func ReadConfiguredCertFile(root, path string) ([]byte, error) {
+	return ReadCertificateFileFromRoot(root, path)
+}
+
+func readBoundedCertFile(file *os.File, path string) ([]byte, error) {
+	info, err := file.Stat()
+	if err != nil {
+		return nil, common.NewError(localCertPathError)
+	}
+	if !info.Mode().IsRegular() || info.Size() == 0 || info.Size() > maxCertFileBytes {
+		return nil, common.NewErrorf("certificate file %q must be a regular file of at most %d bytes", path, maxCertFileBytes)
+	}
+	data, err := io.ReadAll(io.LimitReader(file, maxCertFileBytes+1))
+	if err != nil {
+		return nil, common.NewError(localCertPathError)
+	}
+	if len(data) == 0 || len(data) > maxCertFileBytes {
+		return nil, common.NewErrorf("certificate file %q must be a regular file of at most %d bytes", path, maxCertFileBytes)
+	}
+	return data, nil
+}
+
+func openCertFileWithinRoot(rootPath, path string) (*os.Root, *os.File, error) {
+	root, err := filepath.Abs(rootPath)
+	if err != nil {
+		return nil, nil, err
+	}
+	if !isSafeLocalCertPath(path) && !filepath.IsAbs(path) {
+		return nil, nil, common.NewError(localCertPathError)
+	}
+	candidate := path
+	if !filepath.IsAbs(candidate) {
+		candidate = filepath.Join(root, candidate)
+	}
+	candidate, err = filepath.Abs(candidate)
+	if err != nil || !pathIsWithin(root, candidate) {
+		return nil, nil, common.NewError(localCertPathError)
+	}
+	relative, err := filepath.Rel(root, candidate)
+	if err != nil || !isSafeLocalCertPath(relative) {
+		return nil, nil, common.NewError(localCertPathError)
+	}
+	certRoot, err := os.OpenRoot(root)
+	if err != nil {
+		return nil, nil, err
+	}
+	file, err := certRoot.Open(relative)
+	if err != nil {
+		certRoot.Close()
+		return nil, nil, err
+	}
+	return certRoot, file, nil
+}
+
+func isSafeLocalCertPath(path string) bool {
+	if !filepath.IsLocal(path) || hasParentPathSegment(path) {
+		return false
+	}
+	decoded := path
+	for i := 0; i < 4; i++ {
+		next, err := url.PathUnescape(decoded)
+		if err != nil {
+			return false
+		}
+		if next == decoded {
+			return filepath.IsLocal(decoded) && !hasParentPathSegment(decoded)
+		}
+		decoded = next
+		if !filepath.IsLocal(decoded) || hasParentPathSegment(decoded) {
+			return false
+		}
+	}
+	next, err := url.PathUnescape(decoded)
+	return err == nil && next == decoded && filepath.IsLocal(decoded) && !hasParentPathSegment(decoded)
+}
+
+func hasParentPathSegment(path string) bool {
+	path = strings.ReplaceAll(path, "\\", "/")
+	for _, part := range strings.Split(path, "/") {
+		if part == ".." {
+			return true
+		}
+	}
+	return false
 }
 
 func pathIsWithin(root, candidate string) bool {
@@ -220,28 +301,6 @@ func pathIsWithin(root, candidate string) bool {
 	return strings.HasPrefix(candidate, prefix)
 }
 
-// CheckCertFile refuses a path that exists but is a device, FIFO or oversized file; a
-// missing one is left to the reader, whose open fails at once.
-func CheckCertFile(path string) error {
-	if path == "" {
-		return nil
-	}
-	// Xray supports operator-configured absolute certificate paths. Untrusted Xray build
-	// inputs are confined in CheckConfigCertFiles before file reads; this metadata check
-	// preserves that existing operator-configured path behavior.
-
-	// codeql[go/path-injection] Absolute paths are operator-configured; pushed paths are confined earlier.
-	info, err := os.Stat(path) // lgtm[go/path-injection]
-	if err != nil {
-		return nil
-	}
-	// procfs nodes such as /proc/kmsg report a regular file of size 0.
-	if !info.Mode().IsRegular() || info.Size() == 0 || info.Size() > maxCertFileBytes {
-		return common.NewErrorf("certificate file %q must be a regular file of at most %d bytes", path, maxCertFileBytes)
-	}
-	return nil
-}
-
 // checkUntrustedBuildInput runs before every in-process conf.Build(): inbounds arrive from
 // node pushes and outbounds from third-party subscriptions.
 func checkUntrustedBuildInput(stream *conf.StreamConfig, raw []byte) error {
@@ -250,3 +309,4 @@ func checkUntrustedBuildInput(stream *conf.StreamConfig, raw []byte) error {
 	}
 	return CheckConfigCertFiles(raw)
 }
+

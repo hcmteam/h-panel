@@ -2723,17 +2723,13 @@ func (s *ServerService) GetCertHash(certFile string, certContent string) ([]stri
 	if path := strings.TrimSpace(certFile); path != "" {
 		// Guard against path traversal: only hash certificate files the panel
 		// already references in its own configuration (an inbound's TLS
-		// certificateFile or the panel's own web cert). The path handed to
-		// os.ReadFile comes from that allow-list, never directly from the
-		// caller-supplied value.
+		// certificateFile or the panel's own web cert). The path is opened only
+		// after this allow-list check, relative to its containing directory.
 		known, ok := s.resolveKnownCertFile(path)
 		if !ok {
 			return nil, common.NewError("certificate file is not referenced by any inbound or panel setting")
 		}
-		if err := xray.CheckCertFile(known); err != nil {
-			return nil, err
-		}
-		b, err := os.ReadFile(known)
+		b, err := xray.ReadConfiguredCertFile(filepath.Dir(known), filepath.Base(known))
 		if err != nil {
 			return nil, err
 		}
@@ -3040,3 +3036,4 @@ func (s *ServerService) GetNewmlkem768() (*MLKEM768Response, error) {
 
 	return keyPair, nil
 }
+

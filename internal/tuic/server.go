@@ -1153,14 +1153,15 @@ func loadCertificate(certInput, keyInput string) (tls.Certificate, error) {
 	if strings.Contains(certInput, "-----BEGIN CERTIFICATE-----") {
 		return tls.X509KeyPair([]byte(certInput), []byte(keyInput))
 	}
-	// Certificate paths may point outside the local cert directory for operator-managed
-	// inbounds, so keep the size/type check while preserving absolute path support.
-	for _, path := range []string{certInput, keyInput} {
-		if err := xray.CheckCertFile(path); err != nil {
-			return tls.Certificate{}, err
-		}
+	certificate, err := xray.ReadLocalCertFile(certInput)
+	if err != nil {
+		return tls.Certificate{}, err
 	}
-	return tls.LoadX509KeyPair(certInput, keyInput)
+	privateKey, err := xray.ReadLocalCertFile(keyInput)
+	if err != nil {
+		return tls.Certificate{}, err
+	}
+	return tls.X509KeyPair(certificate, privateKey)
 }
 
 // QUIC Close sends FIN but does not interrupt reads. Relay cancellation must
@@ -1172,3 +1173,4 @@ func (stream tcpRelayStream) Close() error {
 	return stream.Stream.Close()
 }
 func (stream tcpRelayStream) CloseWrite() error { return stream.Stream.Close() }
+
