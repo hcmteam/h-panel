@@ -1172,5 +1172,5 @@ func (stream tcpRelayStream) Close() error {
 	stream.CancelRead(0)
 	return stream.Stream.Close()
 }
-func (stream tcpRelayStream) CloseWrite() error { return stream.Stream.Close() }
 
+func (stream tcpRelayStream) CloseWrite() error { return stream.Stream.Close() }

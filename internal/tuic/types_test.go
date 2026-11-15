@@ -183,4 +183,3 @@ func TestCertificateReadersRefuseWhatIsNoBoundedRegularFile(t *testing.T) {
 		t.Fatal("the oversized certificate file was read into the fingerprint")
 	}
 }
-

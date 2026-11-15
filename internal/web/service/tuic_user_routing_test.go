@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -37,6 +38,14 @@ const tuicRoutingProbe = "tuic-route-probe"
 func TestTuicUserRoutingDoesNotDoubleCountTraffic(t *testing.T) {
 	setupBulkDB(t)
 	cert, key := writeTestCertificate(t)
+	certPEM, err := os.ReadFile(cert)
+	if err != nil {
+		t.Fatal(err)
+	}
+	keyPEM, err := os.ReadFile(key)
+	if err != nil {
+		t.Fatal(err)
+	}
 	udp, err := net.ListenPacket("udp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -48,7 +57,7 @@ func TestTuicUserRoutingDoesNotDoubleCountTraffic(t *testing.T) {
 		{Email: "user@test", ID: uuid.NewString(), Password: "user-password", Enable: true},
 		{Email: "fallback@test", ID: uuid.NewString(), Password: "fallback-password", Enable: true},
 	}
-	settings := map[string]any{"certificate": cert, "private_key": key, "clients": clients, "alpn": []string{"h3"}}
+	settings := map[string]any{"certificate": string(certPEM), "private_key": string(keyPEM), "clients": clients, "alpn": []string{"h3"}}
 	ib := mkInbound(t, port, model.TUIC, string(mustJSON(t, settings)))
 	ib.Listen = "127.0.0.1"
 	if err := database.GetDB().Save(ib).Error; err != nil {

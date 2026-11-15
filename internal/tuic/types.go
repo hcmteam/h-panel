@@ -286,4 +286,3 @@ func NormalizeCongestionControl(value string) (string, error) {
 		return "", fmt.Errorf("tuic: unsupported congestion controller %q", value)
 	}
 }
-
