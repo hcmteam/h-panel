@@ -98,4 +98,3 @@ func TestReadCertificateFileFromRootRejectsOversizedFile(t *testing.T) {
 		t.Fatal("ReadCertificateFileFromRoot accepted an oversized certificate")
 	}
 }
-

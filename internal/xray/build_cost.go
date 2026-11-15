@@ -309,4 +309,3 @@ func checkUntrustedBuildInput(stream *conf.StreamConfig, raw []byte) error {
 	}
 	return CheckConfigCertFiles(raw)
 }
-
