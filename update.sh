@@ -9,6 +9,52 @@ plain='\033[0m'
 xui_folder="${XUI_MAIN_FOLDER:=/usr/local/x-ui}"
 xui_service="${XUI_SERVICE:=/etc/systemd/system}"
 
+# The updater runs as root and replaces files beneath this directory. Resolve
+# symlinks first and keep the target below the dedicated /usr/local install root.
+validate_xui_main_folder() {
+    local requested="${1:-/usr/local/x-ui}" resolved allowed first_component probe suffix base parent
+    [[ "$requested" == /* ]] || { echo "XUI_MAIN_FOLDER must be an absolute path." >&2; return 1; }
+    [[ "$requested" =~ ^/[A-Za-z0-9._/-]+$ ]] || { echo "XUI_MAIN_FOLDER contains unsupported characters." >&2; return 1; }
+    [[ ! "$requested" =~ (^|/)\.\.?(/|$) ]] || { echo "XUI_MAIN_FOLDER cannot contain '.' or '..' path components." >&2; return 1; }
+    command -v readlink >/dev/null 2>&1 || { echo "readlink is required to validate XUI_MAIN_FOLDER." >&2; return 1; }
+    allowed=$(readlink -f /usr/local 2>/dev/null) || { echo "Cannot resolve permitted install root /usr/local." >&2; return 1; }
+    requested="${requested%/}"
+    [[ -n "$requested" ]] || requested="/"
+    resolved=$(readlink -f "$requested" 2>/dev/null) || {
+        # Resolve the
+        # deepest existing ancestor, then append the already-validated missing
+        # components without following a path that has not been created yet.
+        probe="$requested"
+        suffix=""
+        while [[ ! -e "$probe" && ! -L "$probe" ]]; do
+            base="${probe##*/}"
+            parent="${probe%/*}"
+            [[ -n "$base" && "$base" != "." && "$base" != ".." ]] || { echo "Cannot canonicalize XUI_MAIN_FOLDER." >&2; return 1; }
+            suffix="/$base$suffix"
+            probe="${parent:-/}"
+        done
+        [[ -d "$probe" ]] || { echo "The existing XUI_MAIN_FOLDER path must be a directory." >&2; return 1; }
+        parent=$(readlink -f "$probe" 2>/dev/null) || { echo "Cannot canonicalize XUI_MAIN_FOLDER." >&2; return 1; }
+        resolved="${parent%/}${suffix}"
+    }
+    if [[ -e "$requested" || -L "$requested" ]]; then
+        [[ -d "$resolved" ]] || { echo "XUI_MAIN_FOLDER must be a directory path." >&2; return 1; }
+    fi
+    [[ "$resolved" == "$allowed/"* ]] || { echo "XUI_MAIN_FOLDER must resolve beneath /usr/local." >&2; return 1; }
+    [[ "$resolved" != "$allowed" ]] || { echo "XUI_MAIN_FOLDER cannot be /usr/local itself." >&2; return 1; }
+    first_component="${resolved#"$allowed"/}"
+    first_component="${first_component%%/*}"
+    case "$first_component" in
+        bin|sbin|lib|lib64|libexec|share|etc|include|src|games|man|opt|var|Cellar)
+            echo "XUI_MAIN_FOLDER cannot be inside the system-managed /usr/local/$first_component tree." >&2
+            return 1
+            ;;
+    esac
+    printf '%s\n' "$resolved"
+}
+
+xui_folder=$(validate_xui_main_folder "$xui_folder") || exit 1
+
 # Don't edit this config
 b_source="${BASH_SOURCE[0]}"
 while [ -h "$b_source" ]; do
@@ -54,11 +100,140 @@ _write_update_status() {
 }
 
 update_stage_dir=""
+update_backup_dir=""
+update_transaction_active=0
+update_old_service_active=0
+update_old_service_enabled=missing
+update_service_stopped=0
+
+create_update_backup() {
+    local parent="${xui_folder%/*}" env_file db_path service_path rc_path
+    update_backup_dir=$(mktemp -d "${parent}/.x-ui-backup.XXXXXX") || return 1
+    chmod 700 "$update_backup_dir" || return 1
+    mkdir -p "$update_backup_dir/system" || return 1
+    cp -a -- "$xui_folder" "$update_backup_dir/app" || return 1
+    [[ ! -f /usr/bin/x-ui ]] || cp -a /usr/bin/x-ui "$update_backup_dir/system/x-ui-cli" || return 1
+    service_path="${xui_service}/x-ui.service"
+    rc_path=/etc/init.d/x-ui
+    [[ ! -f "$service_path" ]] || cp -a "$service_path" "$update_backup_dir/system/x-ui.service" || return 1
+    [[ ! -f "$rc_path" ]] || cp -a "$rc_path" "$update_backup_dir/system/x-ui.rc" || return 1
+    [[ ! -d "${xui_service}/x-ui.service.d" ]] || cp -a "${xui_service}/x-ui.service.d" "$update_backup_dir/system/" || return 1
+
+    if [[ "${XUI_DB_TYPE:-sqlite}" == "postgres" ]]; then
+        command -v pg_dump >/dev/null 2>&1 && command -v pg_restore >/dev/null 2>&1 || {
+            echo "pg_dump and pg_restore are required to make a rollback-safe PostgreSQL backup." >&2
+            return 1
+        }
+        [[ -n "${XUI_DB_DSN:-}" ]] || { echo "XUI_DB_DSN is required for PostgreSQL rollback backup." >&2; return 1; }
+        pg_dump --format=custom --no-owner --file="$update_backup_dir/database.dump" "$XUI_DB_DSN" || return 1
+        printf 'postgres\n' > "$update_backup_dir/database.type" || return 1
+    else
+        db_path="${XUI_DB_FOLDER:-/etc/x-ui}"
+        [[ "$db_path" == /* ]] || db_path="${xui_folder%/}/$db_path"
+        db_path="${db_path%/}/x-ui.db"
+            printf '%s\n' "$db_path" > "$update_backup_dir/database.path" || return 1
+        if [[ -f "$db_path" ]]; then
+            "${xui_folder}/x-ui" migrate-db --src "$db_path" --dump "$update_backup_dir/database.dump" || return 1
+            printf 'sqlite\n' > "$update_backup_dir/database.type" || return 1
+        else
+            printf 'missing\n' > "$update_backup_dir/database.type" || return 1
+        fi
+    fi
+    chmod 700 "$update_backup_dir" || return 1
+    update_transaction_active=1
+}
+
+discard_incomplete_update_backup() {
+    [[ -z "$update_backup_dir" || ! -d "$update_backup_dir" ]] || rm -rf -- "$update_backup_dir" || return 1
+    update_backup_dir=""
+}
+
+rollback_update() {
+    local db_type db_path failed_db
+    [[ "$update_transaction_active" == 1 && -d "$update_backup_dir" ]] || return 0
+    echo "Update failed; restoring the previous application and database." >&2
+    if [[ "$release" == "alpine" ]]; then
+        rc-service x-ui stop >/dev/null 2>&1 || true
+    else
+        systemctl stop x-ui >/dev/null 2>&1 || true
+    fi
+    if [[ "$update_old_service_enabled" == missing ]]; then set_xui_service_enabled_state missing || return 1; fi
+    rm -rf -- "$xui_folder" || return 1
+    mkdir -p "${xui_folder%/*}" || return 1
+    cp -a -- "$update_backup_dir/app" "$xui_folder" || return 1
+    if [[ -f "$update_backup_dir/system/x-ui-cli" ]]; then
+        cp -a "$update_backup_dir/system/x-ui-cli" /usr/bin/x-ui || return 1
+    else
+        rm -f -- /usr/bin/x-ui || return 1
+    fi
+    if [[ -f "$update_backup_dir/system/x-ui.service" ]]; then cp -a "$update_backup_dir/system/x-ui.service" "${xui_service}/x-ui.service" || return 1; else rm -f -- "${xui_service}/x-ui.service"; fi
+    if [[ -f "$update_backup_dir/system/x-ui.rc" ]]; then cp -a "$update_backup_dir/system/x-ui.rc" /etc/init.d/x-ui || return 1; else rm -f -- /etc/init.d/x-ui; fi
+    if [[ -d "$update_backup_dir/system/x-ui.service.d" ]]; then
+        rm -rf -- "${xui_service}/x-ui.service.d"
+        cp -a "$update_backup_dir/system/x-ui.service.d" "${xui_service}/" || return 1
+    else
+        rm -rf -- "${xui_service}/x-ui.service.d"
+    fi
+    db_type="$(cat "$update_backup_dir/database.type" 2>/dev/null || true)"
+    case "$db_type" in
+        sqlite)
+            db_path="$(cat "$update_backup_dir/database.path")"
+            [[ -n "$db_path" && -s "$update_backup_dir/database.dump" ]] || return 1
+            failed_db="${db_path}.failed.$$"
+            if [[ -e "$db_path" ]]; then mv -- "$db_path" "$failed_db" || return 1; fi
+            if ! "${xui_folder}/x-ui" migrate-db --restore "$update_backup_dir/database.dump" --out "$db_path"; then
+                [[ ! -e "$failed_db" ]] || mv -- "$failed_db" "$db_path"
+                return 1
+            fi
+            rm -f -- "$failed_db"
+            ;;
+        missing)
+            db_path="$(cat "$update_backup_dir/database.path" 2>/dev/null || true)"
+            [[ -n "$db_path" ]] || return 1
+            rm -f -- "$db_path" "${db_path}-wal" "${db_path}-shm" || return 1
+            ;;
+        postgres)
+            [[ -n "${XUI_DB_DSN:-}" && -s "$update_backup_dir/database.dump" ]] || return 1
+            # Object-level rollback only: this dump excludes cluster-global roles and
+            # --no-owner does not restore original ownership. --clean only removes
+            # objects present in the dump; migration-created extras may remain.
+            pg_restore --clean --if-exists --no-owner --single-transaction --dbname="$XUI_DB_DSN" "$update_backup_dir/database.dump" || return 1
+            ;;
+        *)
+            echo "Rollback database metadata is missing or invalid; preserve recovery data at ${update_backup_dir}." >&2
+            return 1
+            ;;
+    esac
+    if [[ "$release" == "alpine" ]]; then
+        [[ "$update_old_service_enabled" == missing ]] || set_xui_service_enabled_state "$update_old_service_enabled" || return 1
+        [[ "$update_old_service_active" != 1 ]] || rc-service x-ui start >/dev/null 2>&1 || return 1
+        [[ "$update_old_service_active" != 1 ]] || rc-service x-ui status >/dev/null 2>&1 || return 1
+    else
+        systemctl daemon-reload >/dev/null 2>&1 || return 1
+        [[ "$update_old_service_enabled" == missing ]] || set_xui_service_enabled_state "$update_old_service_enabled" || return 1
+        [[ "$update_old_service_active" != 1 ]] || systemctl start x-ui >/dev/null 2>&1 || return 1
+        [[ "$update_old_service_active" != 1 ]] || systemctl is-active --quiet x-ui || return 1
+    fi
+    update_transaction_active=0
+    echo "Previous application and database restored." >&2
+}
 
 _report_update_exit() {
     local code=$?
+    if [[ "$code" -ne 0 && "$update_transaction_active" == 1 ]]; then
+        rollback_update || echo "Automatic rollback failed; preserve recovery data at ${update_backup_dir}." >&2
+    elif [[ "$code" -ne 0 && "$update_service_stopped" == 1 && "$update_old_service_active" == 1 ]]; then
+        if [[ "$release" == "alpine" ]]; then
+            rc-service x-ui start >/dev/null 2>&1 || echo "Could not restart the previous x-ui service after pre-replacement failure." >&2
+        else
+            systemctl start x-ui >/dev/null 2>&1 || echo "Could not restart the previous x-ui service after pre-replacement failure." >&2
+        fi
+    fi
     if [[ -n "${update_stage_dir}" && -d "${update_stage_dir}" ]]; then
         rm -rf -- "${update_stage_dir}"
+    fi
+    if [[ "$code" -eq 0 && -n "$update_backup_dir" && -d "$update_backup_dir" ]]; then
+        rm -rf -- "$update_backup_dir"
     fi
     if [[ "${code}" -eq 0 ]]; then
         _write_update_status "success" "0"
@@ -103,7 +278,7 @@ arch() {
         armv6* | armv6) echo 'armv6' ;;
         armv5* | armv5) echo 'armv5' ;;
         s390x) echo 's390x' ;;
-        *) echo -e "${red}Unsupported CPU architecture!${plain}" && rm -f "${cur_dir}/${script_name}" > /dev/null 2>&1 && exit 2 ;;
+        *) echo -e "${red}Unsupported CPU architecture: $(uname -m). The updater was not removed.${plain}" >&2; exit 2 ;;
     esac
 }
 
@@ -118,7 +293,7 @@ gen_random_string() {
 
 xui_env_file_path() {
     case "${release}" in
-        ubuntu | debian | armbian)
+    ubuntu | debian | armbian | linuxmint | pop | elementary | kali | raspbian)
             echo "/etc/default/x-ui"
             ;;
         arch | manjaro | parch | alpine)
@@ -141,33 +316,132 @@ load_xui_env() {
     fi
 }
 
+run_database_migration() {
+    local cli="$1"
+    "$cli" migrate || { echo "Database migration failed." >&2; return 1; }
+}
+
+openrc_xui_service_exists() {
+    [[ -f /etc/init.d/x-ui ]]
+}
+
+query_xui_service_enabled_state() {
+    local output status
+    if [[ "$release" == "alpine" ]]; then
+        openrc_xui_service_exists || { printf 'missing\n'; return 0; }
+        output=$(rc-update show default 2>/dev/null) || return 1
+        if grep -Eq '(^|[[:space:]])x-ui([[:space:]]|$)' <<< "$output"; then
+            printf 'enabled\n'
+        else
+            printf 'disabled\n'
+        fi
+        return 0
+    fi
+
+    if output=$(systemctl is-enabled x-ui 2>/dev/null); then status=0; else status=$?; fi
+    case "${status}:${output}" in
+        0:enabled) printf 'enabled\n' ;;
+        1:disabled) printf 'disabled\n' ;;
+        4:not-found)
+            [[ ! -e "${xui_service}/x-ui.service" ]] || return 1
+            printf 'missing\n'
+            ;;
+        *) return 1 ;;
+    esac
+}
+
+set_xui_service_enabled_state() {
+    case "$1" in
+        enabled)
+            if [[ "$release" == "alpine" ]]; then rc-update add x-ui default >/dev/null 2>&1; else systemctl enable x-ui >/dev/null 2>&1; fi
+            ;;
+        disabled)
+            if [[ "$release" == "alpine" ]]; then rc-update del x-ui default >/dev/null 2>&1; else systemctl disable x-ui >/dev/null 2>&1; fi
+            ;;
+        missing)
+            if [[ "$release" == "alpine" ]]; then
+                openrc_xui_service_exists || return 0
+                rc-update del x-ui default >/dev/null 2>&1
+            else
+                [[ -e "${xui_service}/x-ui.service" ]] || return 0
+                systemctl disable x-ui >/dev/null 2>&1
+            fi
+            ;;
+        *) return 1 ;;
+    esac
+}
+
+stop_xui_service_if_active() {
+    local status
+    if [[ "${release}" == "alpine" ]]; then
+        openrc_xui_service_exists || return 0
+        if rc-service x-ui status >/dev/null 2>&1; then status=0; else status=$?; fi
+        case "$status" in
+            0) rc-service x-ui stop >/dev/null 2>&1 || return 1 ;;
+            3|16) return 0 ;;
+            *) return 1 ;;
+        esac
+        if rc-service x-ui status >/dev/null 2>&1; then status=0; else status=$?; fi
+        case "$status" in 3|16) return 0 ;; *) return 1 ;; esac
+    else
+        if systemctl is-active --quiet x-ui >/dev/null 2>&1; then status=0; else status=$?; fi
+        case "$status" in
+            0) systemctl stop x-ui >/dev/null 2>&1 || return 1 ;;
+            3|4) return 0 ;;
+            *) return 1 ;;
+        esac
+        if systemctl is-active --quiet x-ui >/dev/null 2>&1; then status=0; else status=$?; fi
+        case "$status" in 3|4) return 0 ;; *) return 1 ;; esac
+    fi
+}
+
+start_xui_service() {
+    if [[ "${release}" == "alpine" ]]; then
+        rc-update add x-ui default || return 1
+        rc-service x-ui start || return 1
+        rc-service x-ui status >/dev/null 2>&1 || return 1
+    else
+        systemctl daemon-reload || return 1
+        systemctl enable x-ui || return 1
+        systemctl start x-ui || return 1
+        systemctl is-active --quiet x-ui || return 1
+    fi
+}
+
 install_base() {
     echo -e "${green}Updating and install dependency packages...${plain}"
     case "${release}" in
-        ubuntu | debian | armbian)
+        ubuntu | debian | armbian | linuxmint | pop | elementary | kali | raspbian)
+            command -v apt-get >/dev/null 2>&1 || _fail "Unsupported package manager: apt-get is required for ${release}."
             apt-get update > /dev/null 2>&1 && apt-get install -y -q cron curl tar tzdata socat openssl > /dev/null 2>&1
             ;;
         fedora | amzn | virtuozzo | rhel | almalinux | rocky | ol)
+            command -v dnf >/dev/null 2>&1 || _fail "Unsupported package manager: dnf is required for ${release}."
             dnf makecache -y > /dev/null 2>&1 && dnf install -y -q cronie curl tar tzdata socat openssl > /dev/null 2>&1
             ;;
         centos)
             if [[ "${VERSION_ID}" =~ ^7 ]]; then
+                command -v yum >/dev/null 2>&1 || _fail "Unsupported package manager: yum is required for CentOS 7."
                 yum makecache -y > /dev/null 2>&1 && yum install -y -q cronie curl tar tzdata socat openssl > /dev/null 2>&1
             else
+                command -v dnf >/dev/null 2>&1 || _fail "Unsupported package manager: dnf is required for CentOS."
                 dnf makecache -y > /dev/null 2>&1 && dnf install -y -q cronie curl tar tzdata socat openssl > /dev/null 2>&1
             fi
             ;;
         arch | manjaro | parch)
+            command -v pacman >/dev/null 2>&1 || _fail "Unsupported package manager: pacman is required for ${release}."
             pacman -Sy --noconfirm cronie curl tar tzdata socat openssl > /dev/null 2>&1
             ;;
         opensuse-tumbleweed | opensuse-leap)
+            command -v zypper >/dev/null 2>&1 || _fail "Unsupported package manager: zypper is required for ${release}."
             zypper refresh > /dev/null 2>&1 && zypper -q install -y cron curl tar timezone socat openssl > /dev/null 2>&1
             ;;
         alpine)
+            command -v apk >/dev/null 2>&1 || _fail "Unsupported package manager: apk is required for Alpine."
             apk update > /dev/null 2>&1 && apk add dcron curl tar tzdata socat openssl > /dev/null 2>&1
             ;;
         *)
-            apt-get update > /dev/null 2>&1 && apt install -y -q cron curl tar tzdata socat openssl > /dev/null 2>&1
+            _fail "Unsupported operating system: ${release:-unknown}. Supported systems: Debian/Ubuntu, RHEL-family, Arch, openSUSE, Alpine."
             ;;
     esac
 }
@@ -177,8 +451,6 @@ config_after_update() {
 
     echo -e "${yellow}x-ui settings:${plain}"
     ${xui_folder}/x-ui setting -show true
-    ${xui_folder}/x-ui migrate
-
     # Properly detect empty cert by checking if cert: line exists and has content after it
     local existing_cert=$(${xui_folder}/x-ui setting -getCert true 2> /dev/null | grep 'cert:' | awk -F': ' '{print $2}' | tr -d '[:space:]')
     local settings existing_webBasePath
@@ -529,6 +801,26 @@ release_asset_available() {
     [[ "$status" == "200" ]]
 }
 
+verify_release_checksum() {
+    local url="$1" file="$2" sums="${2}.sha256" code expected actual
+    rm -f -- "$sums"
+    code=$(${curl_bin} -sL --retry 3 --retry-delay 3 --connect-timeout 15 --max-time 60 -o "$sums" -w '%{http_code}' "${url}.sha256" 2>/dev/null)
+    if [[ "$code" != 200 ]]; then
+        rm -f -- "$sums" "$file"
+        echo "ERROR: Could not verify release checksum (HTTP ${code:-unknown}); refusing the archive." >&2
+        return 1
+    fi
+    expected=$(awk 'NR == 1 {print $1}' "$sums")
+    actual=$(sha256sum "$file" | awk '{print $1}')
+    rm -f -- "$sums"
+    if [[ ! "$expected" =~ ^[0-9a-f]{64}$ || "$expected" != "$actual" ]]; then
+        rm -f -- "$file"
+        echo "ERROR: Release checksum is invalid or does not match the archive." >&2
+        return 1
+    fi
+    echo "Checksum verified: ${actual}"
+}
+
 resolve_latest_tag() {
     local url tag stable_asset dev_asset
     stable_asset="https://github.com/hcmteam/H-Panel/releases/download"
@@ -591,28 +883,23 @@ update_x-ui() {
         rm ${xui_folder}-linux-$(arch).tar.gz -f > /dev/null 2>&1
         _fail "ERROR: Downloaded x-ui release archive is empty, please be sure that your server can access GitHub"
     fi
-    # Releases publish <asset>.sha256 next to each archive. A mismatch or a
-    # failed sidecar download aborts the update; only a 404 (releases
-    # predating the sidecar) is tolerated with a warning.
     archive="${xui_folder}-linux-$(arch).tar.gz"
-    rm -f "${archive}.sha256"
-    sidecar_code=$(${curl_bin} -sL --retry 3 --retry-delay 3 --connect-timeout 15 --max-time 60 -o "${archive}.sha256" -w '%{http_code}' "https://github.com/hcmteam/H-Panel/releases/download/${tag_version}/x-ui-linux-$(arch).tar.gz.sha256" 2> /dev/null)
-    if [[ "${sidecar_code}" == "200" ]]; then
-        expected_sha256=$(awk 'NR == 1 {print $1}' "${archive}.sha256")
-        actual_sha256=$(sha256sum "${archive}" | awk '{print $1}')
-        rm -f "${archive}.sha256"
-        if [[ ! "${expected_sha256}" =~ ^[0-9a-f]{64}$ || "${expected_sha256}" != "${actual_sha256}" ]]; then
-            rm -f "${archive}"
-            _fail "ERROR: Checksum mismatch for $(basename "${archive}"): expected ${expected_sha256:-<none>}, got ${actual_sha256}"
-        fi
-        echo -e "${green}Checksum verified: ${actual_sha256}${plain}"
-    elif [[ "${sidecar_code}" == "404" ]]; then
-        rm -f "${archive}.sha256"
-        echo -e "${yellow}No checksum published for this release, skipping verification${plain}"
-    else
-        rm -f "${archive}.sha256" "${archive}"
-        _fail "ERROR: Failed to download the checksum for x-ui-linux-$(arch).tar.gz (HTTP ${sidecar_code})"
+    verify_release_checksum "https://github.com/hcmteam/H-Panel/releases/download/${tag_version}/x-ui-linux-$(arch).tar.gz" "$archive" \
+        || _fail "ERROR: No valid checksum is available for this release; refusing to update."
+
+    local listing member verbose
+    listing=$(tar -tzf "${archive}") || _fail "ERROR: Cannot list the H-Panel release archive"
+    [[ -n "${listing}" ]] || _fail "ERROR: H-Panel release archive is empty"
+    verbose=$(tar -tvzf "${archive}") || _fail "ERROR: Cannot inspect release archive entry types"
+    if printf '%s\n' "$verbose" | awk '$1 !~ /^[-d]/ { found=1 } END { exit !found }'; then
+        _fail "ERROR: Release archives may contain only regular files and directories"
     fi
+    while IFS= read -r member; do
+        [[ -n "${member}" ]] || continue
+        [[ "${member}" != /* ]] || _fail "ERROR: Release archive contains an absolute path"
+        [[ ! "${member}" =~ (^|/)\.\.(/|$) ]] || _fail "ERROR: Release archive contains a parent traversal path"
+        [[ "${member}" == x-ui || "${member}" == x-ui/* ]] || _fail "ERROR: Release archive contains files outside x-ui/"
+    done <<< "${listing}"
 
     # Extract and validate the release while the current panel is still running.
     # This catches corrupt or incomplete archives before service downtime.
@@ -625,10 +912,43 @@ update_x-ui() {
         _fail "ERROR: Failed to extract the H-Panel release archive; the current installation is untouched"
     fi
     staged_xui_dir="${update_stage_dir}/x-ui"
-    if [[ ! -s "${staged_xui_dir}/x-ui" || ! -s "${staged_xui_dir}/x-ui.sh" ]]; then
+    if [[ ! -s "${staged_xui_dir}/x-ui" || ! -s "${staged_xui_dir}/x-ui.sh" || ! -s "${staged_xui_dir}/bin/xray-linux-$(arch)" ]]; then
         rm -f -- "${archive}"
-        _fail "ERROR: H-Panel release archive is missing required files; the current installation is untouched"
+        _fail "ERROR: H-Panel release archive is missing required files for $(arch); the current installation is untouched"
     fi
+    if [[ "$release" != "alpine" && ! -f "$staged_xui_dir/x-ui.service" ]]; then
+        case "$release" in
+            ubuntu|debian|armbian|linuxmint|pop|elementary|kali|raspbian) service_file=x-ui.service.debian ;;
+            arch|manjaro|parch) service_file=x-ui.service.arch ;;
+            *) service_file=x-ui.service.rhel ;;
+        esac
+        if [[ ! -f "$staged_xui_dir/$service_file" ]]; then
+            ${curl_bin} -fLRo "$staged_xui_dir/$service_file" "https://raw.githubusercontent.com/hcmteam/H-Panel/${script_ref}/${service_file}" >/dev/null 2>&1 \
+                || _fail "ERROR: Could not download the required service unit; the current installation is untouched"
+            [[ -s "$staged_xui_dir/$service_file" ]] || _fail "ERROR: Downloaded service unit is empty; the current installation is untouched"
+        fi
+    fi
+
+    if ! update_old_service_enabled=$(query_xui_service_enabled_state); then
+        _fail "ERROR: Could not reliably determine whether the existing x-ui service is enabled; aborting before service or application changes"
+    fi
+    if [[ "$release" == "alpine" ]]; then
+        rc-service x-ui status >/dev/null 2>&1 && update_old_service_active=1 || true
+    else
+        systemctl is-active --quiet x-ui && update_old_service_active=1 || true
+    fi
+    update_service_stopped=1
+    stop_xui_service_if_active || _fail "ERROR: Could not stop x-ui before backup"
+    if ! create_update_backup; then
+        if [[ "$update_old_service_active" == 1 ]]; then
+            if [[ "$release" == "alpine" ]]; then rc-service x-ui start >/dev/null 2>&1 || true; else systemctl start x-ui >/dev/null 2>&1 || true; fi
+        fi
+        if ! discard_incomplete_update_backup; then
+            echo "Could not remove the incomplete rollback backup; preserve it for inspection at ${update_backup_dir}." >&2
+        fi
+        _fail "ERROR: Could not create a complete rollback backup; update was stopped before replacement"
+    fi
+    update_transaction_active=1
 
     # Download everything before x-ui stops, because its Xray and any panel egress bridge
     # stop with it. Alpine's init script is the only file the archive lacks.
@@ -651,21 +971,14 @@ update_x-ui() {
         echo -e "${green}Stopping x-ui...${plain}"
         if [[ $release == "alpine" ]]; then
             if [ -f "/etc/init.d/x-ui" ]; then
-                rc-service x-ui stop > /dev/null 2>&1
-                rc-update del x-ui > /dev/null 2>&1
-                echo -e "${green}Removing old service unit version...${plain}"
-                rm -f /etc/init.d/x-ui > /dev/null 2>&1
+                echo -e "${green}Keeping existing OpenRC service enabled during replacement...${plain}"
             else
                 rm x-ui-linux-$(arch).tar.gz -f > /dev/null 2>&1
                 _fail "ERROR: x-ui service unit not installed."
             fi
         else
             if [ -f "${xui_service}/x-ui.service" ]; then
-                systemctl stop x-ui > /dev/null 2>&1
-                systemctl disable x-ui > /dev/null 2>&1
-                echo -e "${green}Removing old systemd unit version...${plain}"
-                rm ${xui_service}/x-ui.service -f > /dev/null 2>&1
-                systemctl daemon-reload > /dev/null 2>&1
+                echo -e "${green}Keeping existing systemd service enabled during replacement...${plain}"
             else
                 rm x-ui-linux-$(arch).tar.gz -f > /dev/null 2>&1
                 _fail "ERROR: x-ui systemd unit not installed."
@@ -752,7 +1065,8 @@ update_x-ui() {
     # Finish the schema/data migrations before the service starts, so the service and
     # config_after_update's CLI calls never run them on the same database at once (#6728).
     echo -e "${green}Migrating database...${plain}"
-    "${xui_folder}/x-ui" migrate
+    stop_xui_service_if_active || _fail "ERROR: Could not ensure x-ui is stopped before database migration."
+    run_database_migration "${xui_folder}/x-ui" || _fail "ERROR: Database migration failed; rolling back the application and database."
 
     if [[ $release == "alpine" ]]; then
         echo -e "${green}Installing startup unit x-ui.rc...${plain}"
@@ -763,8 +1077,7 @@ update_x-ui() {
         fi
         chmod +x /etc/init.d/x-ui > /dev/null 2>&1
         chown root:root /etc/init.d/x-ui > /dev/null 2>&1
-        rc-update add x-ui > /dev/null 2>&1
-        rc-service x-ui start > /dev/null 2>&1
+        start_xui_service || _fail "ERROR: Could not enable/start x-ui or verify that it is active"
     else
         if [ -f "x-ui.service" ]; then
             echo -e "${green}Installing systemd unit...${plain}"
@@ -824,18 +1137,27 @@ update_x-ui() {
         fi
         chown root:root ${xui_service}/x-ui.service > /dev/null 2>&1
         chmod 644 ${xui_service}/x-ui.service > /dev/null 2>&1
-        systemctl daemon-reload > /dev/null 2>&1
-        systemctl enable x-ui > /dev/null 2>&1
-        systemctl start x-ui > /dev/null 2>&1
+        start_xui_service || _fail "ERROR: Could not enable/start x-ui or verify that it is active"
     fi
 
-    config_after_update
+    config_after_update || _fail "ERROR: Could not apply existing panel settings after update"
+    if [[ "$release" == "alpine" ]]; then
+        rc-service x-ui status >/dev/null 2>&1 || _fail "ERROR: x-ui is not active after post-update configuration"
+    else
+        systemctl is-active --quiet x-ui || _fail "ERROR: x-ui is not active after post-update configuration"
+    fi
 
     # IP Limit relies on fail2ban; install + configure it now so the feature
     # works out of the box on update too (no-op when XUI_ENABLE_FAIL2BAN=false).
     # Never fatal.
     setup_fail2ban
+    if [[ "$release" == "alpine" ]]; then
+        rc-service x-ui status >/dev/null 2>&1 || _fail "ERROR: x-ui is not active after setup"
+    else
+        systemctl is-active --quiet x-ui || _fail "ERROR: x-ui is not active after setup"
+    fi
 
+    update_transaction_active=0
     echo -e "${green}x-ui ${tag_version}${plain} updating finished, it is running now..."
     echo -e ""
     echo -e "┌───────────────────────────────────────────────────────┐
@@ -859,6 +1181,8 @@ update_x-ui() {
 }
 
 echo -e "${green}Running...${plain}"
+load_xui_env
+xui_folder=$(validate_xui_main_folder "${XUI_MAIN_FOLDER:-/usr/local/x-ui}") || _fail "FATAL ERROR: unsafe XUI_MAIN_FOLDER"
 require_writable_update_paths
-install_base
+install_base || _fail "ERROR: failed to install required packages"
 update_x-ui $1
